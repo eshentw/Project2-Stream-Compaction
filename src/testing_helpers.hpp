@@ -58,6 +58,7 @@ void genArray(int n, int *a, int maxval) {
 }
 
 void printArray(int n, int *a, bool abridged = false) {
+    // print first 13, last 2 elements
     printf("    [ ");
     for (int i = 0; i < n; i++) {
         if (abridged && i + 2 == 15 && n > 16) {
