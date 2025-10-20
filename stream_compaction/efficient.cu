@@ -60,9 +60,7 @@ namespace StreamCompaction {
             const int depth = ilog2ceil(fullSize);
             for (int level = 1; level <= depth; ++level) {
                 size_t active = static_cast<size_t>(fullSize) >> level;
-                if (active == 0) {
-                    active = 1;
-                }
+                active = active == 0 ? 1 : active; // ensure at least one block
                 int gridSize = static_cast<int>((active + BLOCK_SIZE - 1) / BLOCK_SIZE);
                 kernUpsweep<<<gridSize, BLOCK_SIZE>>>(fullSize, level, dev_data);
                 checkCUDAError("kernUpsweep failed!");
@@ -71,9 +69,7 @@ namespace StreamCompaction {
             checkCUDAError("memset failed!");
             for (int level = depth; level >= 1; --level) {
                 size_t active = static_cast<size_t>(fullSize) >> level;
-                if (active == 0) {
-                    active = 1;
-                }
+                active = active == 0 ? 1 : active;
                 int gridSize = static_cast<int>((active + BLOCK_SIZE - 1) / BLOCK_SIZE);
                 kernDownsweep<<<gridSize, BLOCK_SIZE>>>(fullSize, level, dev_data);
                 checkCUDAError("kernDownsweep failed!");
@@ -87,6 +83,93 @@ namespace StreamCompaction {
             timer().startGpuTimer();
             exclusiveScanImpl(n, odata, idata);
             timer().endGpuTimer();
+        }
+
+        __global__ void kernScanOpt(size_t n, const int *idata, int *odata, int *blockSum) {
+            extern __shared__ int smem[];
+            size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+            if (index >= n) {
+                return;
+            }
+            smem[threadIdx.x] = idata[index];
+
+            // up-sweep
+            for (int offset = 1; offset <= ilog2ceil(blockDim.x); offset += 1) {
+                __syncthreads();
+                size_t stride = 1 << offset;
+                size_t idx = threadIdx.x * stride;
+                if (idx + stride - 1 < blockDim.x) {
+                    smem[idx + stride - 1] += smem[idx + (stride >> 1) - 1];
+                }
+            }
+            // write the sum of each block to blockSum array
+            if (threadIdx.x == 0) {
+                blockSum[blockIdx.x] = smem[blockDim.x - 1];
+                smem[blockDim.x - 1] = 0;
+            }
+            // down-sweep
+            for (int offset = ilog2ceil(blockDim.x); offset >= 1; --offset) {
+                __syncthreads();
+                size_t stride = 1 << offset;
+                size_t idx = threadIdx.x * stride;
+                if (idx + stride - 1 < blockDim.x) {
+                    int t = smem[idx + (stride >> 1) - 1];
+                    smem[idx + (stride >> 1) - 1] = smem[idx + stride - 1];
+                    smem[idx + stride - 1] += t;
+                }
+            }
+            __syncthreads();
+            odata[index] = smem[threadIdx.x];
+        }
+
+        void scanOpt(int n, int *odata, const int *idata) {
+            int *dev_idata, *dev_odata;
+            int *dev_blockSum, *blockSum;
+
+            // pad the input array to the next power of two
+            int log2ceil = ilog2ceil(n);
+            size_t fullSize = 1 << log2ceil;
+
+            cudaMalloc(&dev_idata, fullSize * sizeof(int));
+            cudaMalloc(&dev_odata, fullSize * sizeof(int));
+            cudaMemcpy(dev_idata, idata, n * sizeof(int), cudaMemcpyHostToDevice);
+             if (fullSize > n) {
+                 cudaMemset(dev_idata + n, 0, (fullSize - n) * sizeof(int));
+                 checkCUDAError("padding memset failed");
+             }
+
+            int gridSize = static_cast<int>((fullSize + BLOCK_SIZE - 1) / BLOCK_SIZE);
+            cudaMalloc(&dev_blockSum, gridSize * sizeof(int));
+            cudaMemset(dev_blockSum, 0, gridSize * sizeof(int));
+            blockSum = new int[gridSize];
+
+            timer().startGpuTimer();
+            kernScanOpt<<<gridSize, BLOCK_SIZE, BLOCK_SIZE * sizeof(int)>>>(fullSize, dev_idata, dev_odata, dev_blockSum);
+            checkCUDAError("kernScanOpt failed!");
+            cudaMemcpy(blockSum, dev_blockSum, gridSize * sizeof(int), cudaMemcpyDeviceToHost);
+            // scan the blockSum array across blocks
+//            exclusiveScanImpl(gridSize, blockSum, blockSum);
+            // simple CPU exclusive scan since gridSize is small
+            int prefix = 0;
+            for (int i = 0; i < gridSize; ++i) {
+                int current = blockSum[i];
+                blockSum[i] = prefix;
+                prefix += current;
+            }
+            
+            cudaMemcpy(dev_blockSum, blockSum, gridSize * sizeof(int), cudaMemcpyHostToDevice);
+            // add the scanned blockSum to each block
+            StreamCompaction::Common::kernAddOffset<<<(fullSize + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
+                fullSize, dev_odata, dev_blockSum, BLOCK_SIZE);
+            checkCUDAError("kernAddOffset failed!");
+            
+            timer().endGpuTimer();
+            // copy back the n elements
+            cudaMemcpy(odata, dev_odata, n * sizeof(int), cudaMemcpyDeviceToHost);
+            cudaFree(dev_idata);
+            cudaFree(dev_odata);
+            cudaFree(dev_blockSum);
+            delete[] blockSum;
         }
 
         /**

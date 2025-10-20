@@ -45,5 +45,13 @@ namespace StreamCompaction {
         	return;
         }
 
+        __global__ void kernAddOffset(size_t n, int *data, int *blockSum, int blockSize) {
+            size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+            if (index >= n) return;
+            int blockId = index / blockSize;
+            data[index] += blockSum[blockId];
+            return;
+        }
+
     }
 }

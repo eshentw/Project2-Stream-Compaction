@@ -37,6 +37,8 @@ namespace StreamCompaction {
         __global__ void kernScatter(int n, int *odata,
                 const int *idata, const int *bools, const int *indices);
 
+        __global__ void kernAddOffset(size_t n, int *data, int *blockSum, int blockSize);
+
         /**
         * This class is used for timing the performance
         * Uncopyable and unmovable
