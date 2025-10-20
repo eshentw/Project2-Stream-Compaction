@@ -4,8 +4,9 @@
 #include "efficient.h"
 
 #define BLOCK_SIZE 512
-#define NUM_BANKS 16
-#define LOG_NUM_BANKS 4
+#define NUM_BANKS 32
+#define LOG_NUM_BANKS 5
+#define CONFLICT_FREE_OFFSET(n) ((n) >> LOG_NUM_BANKS)
 
 namespace StreamCompaction {
     namespace Efficient {
@@ -88,24 +89,35 @@ namespace StreamCompaction {
         __global__ void kernScanOpt(size_t n, const int *idata, int *odata, int *blockSum) {
             extern __shared__ int smem[];
             size_t index = blockIdx.x * blockDim.x + threadIdx.x;
-            if (index >= n) {
-                return;
+            int tid = threadIdx.x;
+            // pad the shared memory to avoid bank conflicts
+            // since share memory is allocated per block, so we need to add offset based on tid only
+            int paddedIdx = tid + CONFLICT_FREE_OFFSET(tid);
+            int value = 0;
+            if (index < n) {
+                value = idata[index];
             }
-            smem[threadIdx.x] = idata[index];
-
+            smem[paddedIdx] = value;
+            int left, right;
             // up-sweep
             for (int offset = 1; offset <= ilog2ceil(blockDim.x); offset += 1) {
                 __syncthreads();
                 size_t stride = 1 << offset;
                 size_t idx = threadIdx.x * stride;
                 if (idx + stride - 1 < blockDim.x) {
-                    smem[idx + stride - 1] += smem[idx + (stride >> 1) - 1];
+                    left = idx + (stride >> 1) - 1;
+                    left += CONFLICT_FREE_OFFSET(left);
+                    right = idx + stride - 1;
+                    right += CONFLICT_FREE_OFFSET(right);
+                    smem[right] += smem[left];
                 }
             }
             // write the sum of each block to blockSum array
             if (threadIdx.x == 0) {
-                blockSum[blockIdx.x] = smem[blockDim.x - 1];
-                smem[blockDim.x - 1] = 0;
+                int last = blockDim.x - 1;
+                int paddedLast = last + CONFLICT_FREE_OFFSET(last);
+                blockSum[blockIdx.x] = smem[paddedLast];
+                smem[paddedLast] = 0;
             }
             // down-sweep
             for (int offset = ilog2ceil(blockDim.x); offset >= 1; --offset) {
@@ -113,13 +125,19 @@ namespace StreamCompaction {
                 size_t stride = 1 << offset;
                 size_t idx = threadIdx.x * stride;
                 if (idx + stride - 1 < blockDim.x) {
-                    int t = smem[idx + (stride >> 1) - 1];
-                    smem[idx + (stride >> 1) - 1] = smem[idx + stride - 1];
-                    smem[idx + stride - 1] += t;
+                    left = idx + (stride >> 1) - 1;
+                    left += CONFLICT_FREE_OFFSET(left);
+                    right = idx + stride - 1;
+                    right += CONFLICT_FREE_OFFSET(right);
+                    int t = smem[left];
+                    smem[left] = smem[right];
+                    smem[right] += t;
                 }
             }
             __syncthreads();
-            odata[index] = smem[threadIdx.x];
+            if (index < n) {
+                odata[index] = smem[paddedIdx];
+            }
         }
 
         void scanOpt(int n, int *odata, const int *idata) {
@@ -144,7 +162,9 @@ namespace StreamCompaction {
             blockSum = new int[gridSize];
 
             timer().startGpuTimer();
-            kernScanOpt<<<gridSize, BLOCK_SIZE, BLOCK_SIZE * sizeof(int)>>>(fullSize, dev_idata, dev_odata, dev_blockSum);
+            kernScanOpt<<<gridSize, BLOCK_SIZE,
+                (BLOCK_SIZE + CONFLICT_FREE_OFFSET(BLOCK_SIZE)) * sizeof(int)>>>(
+                    fullSize, dev_idata, dev_odata, dev_blockSum);
             checkCUDAError("kernScanOpt failed!");
             cudaMemcpy(blockSum, dev_blockSum, gridSize * sizeof(int), cudaMemcpyDeviceToHost);
             // scan the blockSum array across blocks
@@ -162,7 +182,7 @@ namespace StreamCompaction {
             StreamCompaction::Common::kernAddOffset<<<(fullSize + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
                 fullSize, dev_odata, dev_blockSum, BLOCK_SIZE);
             checkCUDAError("kernAddOffset failed!");
-            
+
             timer().endGpuTimer();
             // copy back the n elements
             cudaMemcpy(odata, dev_odata, n * sizeof(int), cudaMemcpyDeviceToHost);
