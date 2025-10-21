@@ -12,18 +12,14 @@ namespace StreamCompaction {
 
         __global__ void kernScanOpt(size_t n, const int *idata, int *odata, int *blockSum);
 
-        __global__ void kernAddScannedBlockSums(int n, int* odata, const int* blockSums);
-
-        __global__ void kernBlockScan(int n, int* odata, const int* idata, int* blockSums);
-
         void exclusiveScanImpl(int n, int *odata, const int *idata);
 
         void scan(int n, int *odata, const int *idata);
 
         void scanOpt(int n, int *odata, const int *idata);
 
-        void scanShared(int n, int* odata, const int* idata);
-
         int compact(int n, int *odata, const int *idata);
+
+        int compactOpt(int n, int *odata, const int *idata);
     }
 }
